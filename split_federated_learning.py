@@ -645,7 +645,20 @@ print("Training and Evaluation completed!")
 round_process = [i for i in range(1, len(acc_train_collect)+1)]
 df = DataFrame({'round': round_process,'acc_train':acc_train_collect, 'acc_test':acc_test_collect})     
 file_name = program+".xlsx"    
-df.to_excel(file_name, sheet_name="v1_test", index=False)     
+df.to_excel(file_name, sheet_name="v1_test", index=False)
+
+#===============================================================================
+# Save trained models
+if not os.path.exists('model'):
+    os.makedirs('model')
+
+# Save client model
+torch.save(net_glob_client.state_dict(), 'model/SFL_MobileNetV2_client_PlantVillage_final.pth')
+print("✅ Client model saved to model/SFL_MobileNetV2_client_PlantVillage_final.pth")
+
+# Save server model
+torch.save(net_glob_server.state_dict(), 'model/SFL_MobileNetV2_server_PlantVillage_final.pth')
+print("✅ Server model saved to model/SFL_MobileNetV2_server_PlantVillage_final.pth")
 
 #=============================================================================
 #                         Program Completed
