@@ -51,7 +51,7 @@ def prGreen(skk): print("\033[92m {}\033[00m" .format(skk))
 #===================================================================
 # No. of users
 num_users = 5
-epochs = 5
+epochs = 50
 frac = 1        # participation of clients; if 1 then 100% clients participate in SFLV1
 lr = 0.0001
 
