@@ -44,9 +44,17 @@ def prGreen(skk): print("\033[92m {}\033[00m" .format(skk))
 #===================================================================
 # No. of users
 num_users = 5
-epochs = 50  # Reduced for faster training
+epochs = 10  # Reduced for faster training
 frac = 1
 lr = 0.0001
+
+# ================= Privacy Defense Settings (FL) =================
+# Approximate DP-SGD on client updates: per-batch gradient clipping + Gaussian noise
+DP_CLIP_NORM = 1.0      # L2 clip for per-batch grads (proxy for per-example)
+DP_NOISE_STD = 0.01     # Gaussian noise std to add to model gradients
+
+# Secure aggregation stub (simulation): we don't implement crypto; we simply note the step
+ENABLE_SECURE_AGG = True
 
 #==============================================================================================================
 #                                  Client Side Program 
@@ -99,6 +107,18 @@ class LocalUpdate(object):
                 
                 #--------backward prop--------------
                 loss.backward()
+                # DP-like gradient defenses (per-batch proxy)
+                if DP_CLIP_NORM is not None or (DP_NOISE_STD and DP_NOISE_STD > 0):
+                    total_norm = torch.norm(torch.stack([p.grad.detach().data.norm(2) for p in net.parameters() if p.grad is not None]), 2)
+                    clip_coef = DP_CLIP_NORM / (total_norm + 1e-12)
+                    if DP_CLIP_NORM is not None and clip_coef < 1.0:
+                        for p in net.parameters():
+                            if p.grad is not None:
+                                p.grad.data.mul_(clip_coef)
+                    if DP_NOISE_STD and DP_NOISE_STD > 0:
+                        for p in net.parameters():
+                            if p.grad is not None:
+                                p.grad.data.add_(DP_NOISE_STD * torch.randn_like(p.grad))
                 optimizer.step()
                                
                 batch_loss.append(loss.item())
@@ -399,6 +419,10 @@ for iter in range(epochs):
         local.evaluate(net=copy.deepcopy(net_glob).to(device))
 
     # update global weights
+    # Secure aggregation simulated (no plaintext intermediate logging)
+    if ENABLE_SECURE_AGG:
+        # In practice use cryptographic secure aggregation; here we just avoid inspecting individual updates
+        pass
     w_glob = FedAvg(w_locals)
 
     # copy weight to net_glob

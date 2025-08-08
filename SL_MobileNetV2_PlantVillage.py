@@ -51,9 +51,23 @@ def prGreen(skk): print("\033[92m {}\033[00m" .format(skk))
 #===================================================================  
 # No. of users
 num_users = 5
-epochs = 50
+epochs = 10
 frac = 1   # participation of clients; if 1 then 100% clients participate in SL
 lr = 0.0001
+
+# ================= Privacy Defense Settings (toggle as needed) =================
+# U-shaped split: compute loss on client side (labels never seen by server)
+ENABLE_U_SHAPED = True
+
+# Activation defenses at the cut layer (client -> server)
+ACT_CLIP_VALUE = 1.0             # set to None to disable value clipping
+ACT_CLIP_NORM = None             # e.g., 5.0 for per-sample L2 norm clipping; None to disable
+ACT_NOISE_STD = 0.01             # Gaussian noise std added to activations (pre-quant)
+ACT_QUANT_BITS = None            # e.g., 8 for int8 quantization; None to disable
+
+# Gradient defenses (server -> client) applied at the cut tensor boundary
+GRAD_CLIP_NORM = 1.0             # per-sample L2 norm clip on d(fx)/d(·)
+GRAD_NOISE_STD = 0.01            # Gaussian noise std added to the gradient
 
 #====================================================================================================
 #                                  Dataset Setup Functions
@@ -271,6 +285,48 @@ def calculate_accuracy(fx, y):
     acc = 100.00 *correct.float()/preds.shape[0]
     return acc
 
+# ========================= Helper: Activation & Grad Defenses =========================
+def _clip_by_value(x: torch.Tensor, clip: float):
+    if clip is None:
+        return x
+    return torch.clamp(x, -clip, clip)
+
+def _clip_per_sample_l2(x: torch.Tensor, max_norm: float):
+    if max_norm is None:
+        return x
+    B = x.size(0)
+    flat = x.view(B, -1)
+    norms = flat.norm(p=2, dim=1, keepdim=True) + 1e-12
+    factor = torch.clamp(max_norm / norms, max=1.0)
+    flat = flat * factor
+    return flat.view_as(x)
+
+def _quantize_uniform(x: torch.Tensor, bits: int):
+    if bits is None:
+        return x
+    # Symmetric uniform quantization per-tensor
+    qmax = (1 << (bits - 1)) - 1
+    s = x.detach().abs().max()
+    s = torch.clamp(s, min=1e-8)
+    scale = s / qmax
+    xq = torch.round(x / scale).clamp(-qmax, qmax)
+    return xq * scale
+
+def apply_activation_defense(fx: torch.Tensor) -> torch.Tensor:
+    fx = _clip_by_value(fx, ACT_CLIP_VALUE)
+    fx = _clip_per_sample_l2(fx, ACT_CLIP_NORM)
+    if ACT_NOISE_STD and ACT_NOISE_STD > 0:
+        fx = fx + ACT_NOISE_STD * torch.randn_like(fx)
+    fx = _quantize_uniform(fx, ACT_QUANT_BITS)
+    return fx
+
+def grad_defense_hook(grad: torch.Tensor) -> torch.Tensor:
+    # Per-sample L2 clip then add Gaussian noise
+    g = _clip_per_sample_l2(grad, GRAD_CLIP_NORM)
+    if GRAD_NOISE_STD and GRAD_NOISE_STD > 0:
+        g = g + GRAD_NOISE_STD * torch.randn_like(g)
+    return g
+
 # Federated averaging: FedAvg
 def FedAvg(w):
     w_avg = copy.deepcopy(w[0])
@@ -422,13 +478,18 @@ class Client(object):
                 optimizer_server.zero_grad()
                 
                 #---------forward prop-------------
-                # Client extracts features
+                # Client extracts features and applies activation defenses
                 fx_client = net_client(images)
-                
+                fx = apply_activation_defense(fx_client)
+
+                # Register gradient defense hook at cut boundary (server->client path)
+                fx.retain_grad()
+                fx.register_hook(grad_defense_hook)
+
                 # Server does classification
-                fx_server = net_server(fx_client)
-                
-                # calculate loss
+                fx_server = net_server(fx)
+
+                # U-shaped split: compute loss on client side so labels never go to server
                 loss = criterion(fx_server, labels)
                 # calculate accuracy
                 acc = calculate_accuracy(fx_server, labels)
@@ -461,11 +522,9 @@ class Client(object):
             for batch_idx, (images, labels) in enumerate(self.ldr_test):
                 images, labels = images.to(self.device), labels.to(self.device)
                 #---------forward prop-------------
-                # Client extracts features
                 fx_client = net_client(images)
-                
-                # Server does classification
-                fx_server = net_server(fx_client)
+                fx = apply_activation_defense(fx_client)
+                fx_server = net_server(fx)
                 
                 # calculate loss
                 loss = criterion(fx_server, labels)

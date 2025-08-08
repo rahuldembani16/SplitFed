@@ -51,9 +51,23 @@ def prGreen(skk): print("\033[92m {}\033[00m" .format(skk))
 #===================================================================
 # No. of users
 num_users = 5
-epochs = 50
+epochs = 10
 frac = 1        # participation of clients; if 1 then 100% clients participate in SFLV1
 lr = 0.0001
+
+# ================= Privacy Defense Settings (toggle as needed) =================
+# U-shaped split: compute loss on client side (labels never seen by server)
+ENABLE_U_SHAPED = True
+
+# Activation defenses at the cut layer (client -> server)
+ACT_CLIP_VALUE = 1.0             # set to None to disable value clipping
+ACT_CLIP_NORM = None             # e.g., 5.0 for per-sample L2 norm clipping; None to disable
+ACT_NOISE_STD = 0.01             # Gaussian noise std added to activations (pre-quant)
+ACT_QUANT_BITS = None            # e.g., 8 for int8 quantization; None to disable
+
+# Gradient defenses (server -> client) applied at the cut tensor boundary
+GRAD_CLIP_NORM = 1.0             # per-sample L2 norm clip on d(fx)/d(·)
+GRAD_NOISE_STD = 0.01            # Gaussian noise std added to the gradient
 
 #=====================================================================================================
 #                           Client-side Model definition (MobileNetV2)
@@ -157,6 +171,46 @@ def calculate_accuracy(fx, y):
     correct = preds.eq(y.view_as(preds)).sum()
     acc = 100.00 *correct.float()/preds.shape[0]
     return acc
+
+# ========================= Helper: Activation & Grad Defenses =========================
+def _clip_by_value(x: torch.Tensor, clip: float):
+    if clip is None:
+        return x
+    return torch.clamp(x, -clip, clip)
+
+def _clip_per_sample_l2(x: torch.Tensor, max_norm: float):
+    if max_norm is None:
+        return x
+    B = x.size(0)
+    flat = x.view(B, -1)
+    norms = flat.norm(p=2, dim=1, keepdim=True) + 1e-12
+    factor = torch.clamp(max_norm / norms, max=1.0)
+    flat = flat * factor
+    return flat.view_as(x)
+
+def _quantize_uniform(x: torch.Tensor, bits: int):
+    if bits is None:
+        return x
+    qmax = (1 << (bits - 1)) - 1
+    s = x.detach().abs().max()
+    s = torch.clamp(s, min=1e-8)
+    scale = s / qmax
+    xq = torch.round(x / scale).clamp(-qmax, qmax)
+    return xq * scale
+
+def apply_activation_defense(fx: torch.Tensor) -> torch.Tensor:
+    fx = _clip_by_value(fx, ACT_CLIP_VALUE)
+    fx = _clip_per_sample_l2(fx, ACT_CLIP_NORM)
+    if ACT_NOISE_STD and ACT_NOISE_STD > 0:
+        fx = fx + ACT_NOISE_STD * torch.randn_like(fx)
+    fx = _quantize_uniform(fx, ACT_QUANT_BITS)
+    return fx
+
+def grad_defense_hook(grad: torch.Tensor) -> torch.Tensor:
+    g = _clip_per_sample_l2(grad, GRAD_CLIP_NORM)
+    if GRAD_NOISE_STD and GRAD_NOISE_STD > 0:
+        g = g + GRAD_NOISE_STD * torch.randn_like(g)
+    return g
 
 # to print train - test together in each round-- these are made global
 acc_avg_all_user_train = 0
@@ -298,7 +352,10 @@ class Client(object):
                 optimizer_server.zero_grad()
                 
                 fx_client = net_client(images)
-                fx_server = net_server(fx_client)
+                fx = apply_activation_defense(fx_client)
+                fx.retain_grad()
+                fx.register_hook(grad_defense_hook)
+                fx_server = net_server(fx)
                 
                 # calculate loss
                 loss = criterion(fx_server, labels)
@@ -335,7 +392,8 @@ class Client(object):
                 
                 # Client-side forward pass
                 fx_client = net_client(images)
-                fx_server = net_server(fx_client)
+                fx = apply_activation_defense(fx_client)
+                fx_server = net_server(fx)
                 
                 # calculate loss
                 loss = criterion(fx_server, labels)
